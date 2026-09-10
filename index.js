@@ -1,14 +1,99 @@
 const express = require('express');
+const https = require('https');
+const http = require('http');
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    res.send('Apostado Manager & Management Bot is alive and running 24/7!');
+    const isReady = client && client.user;
+    const uptimeSec = Math.floor(process.uptime());
+    const hours = Math.floor(uptimeSec / 3600);
+    const minutes = Math.floor((uptimeSec % 3600) / 60);
+    const seconds = uptimeSec % 60;
+
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Bot Status | 24/7 Active</title>
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+                .card { background: #1e293b; padding: 2.5rem; border-radius: 1rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); text-align: center; max-width: 420px; width: 90%; border: 1px solid #334155; }
+                .badge { display: inline-block; padding: 0.35rem 0.8rem; border-radius: 9999px; font-weight: bold; font-size: 0.875rem; margin-bottom: 1rem; background: #22c55e22; color: #4ade80; border: 1px solid #22c55e44; }
+                h1 { margin: 0 0 0.5rem 0; font-size: 1.5rem; }
+                p { color: #94a3b8; margin: 0.25rem 0; font-size: 0.95rem; }
+                .stats { margin-top: 1.5rem; padding-top: 1.2rem; border-top: 1px solid #334155; display: flex; justify-content: space-around; }
+                .stat-num { font-size: 1.25rem; font-weight: bold; color: #38bdf8; }
+                .stat-label { font-size: 0.75rem; color: #64748b; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div class="badge">● Online & 24/7 Active</div>
+                <h1>${isReady ? client.user.tag : 'Discord Bot'}</h1>
+                <p>Status: ${isReady ? 'Connected to Discord' : 'Starting up...'}</p>
+                <div class="stats">
+                    <div>
+                        <div class="stat-num">${hours}h ${minutes}m ${seconds}s</div>
+                        <div class="stat-label">Uptime</div>
+                    </div>
+                    <div>
+                        <div class="stat-num">${isReady ? client.guilds.cache.size : 0}</div>
+                        <div class="stat-label">Servers</div>
+                    </div>
+                    <div>
+                        <div class="stat-num">${isReady ? Math.round(client.ws.ping) + 'ms' : '-'}</div>
+                        <div class="stat-label">Ping</div>
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+    `);
+});
+
+app.get('/ping', (req, res) => {
+    res.status(200).json({ 
+        status: 'ok', 
+        bot: client && client.user ? client.user.tag : 'starting',
+        uptime: `${Math.floor(process.uptime())}s`, 
+        timestamp: new Date().toISOString() 
+    });
 });
 
 app.listen(port, () => {
     console.log(`Web server is listening on port ${port}`);
+    startKeepAlive();
 });
+
+// Self-ping to prevent Render from going idle when URL is provided
+function startKeepAlive() {
+    const serviceUrl = process.env.RENDER_EXTERNAL_URL || process.env.SERVICE_URL || process.env.RENDER_URL;
+    if (!serviceUrl) {
+        console.log('ℹ️ [Keep-Alive] RENDER_EXTERNAL_URL not detected. Using UptimeRobot is highly recommended to keep Render awake 24/7.');
+        return;
+    }
+
+    console.log(`[Keep-Alive] Keep-alive service active for: ${serviceUrl}`);
+    const pingUrl = serviceUrl.endsWith('/') ? `${serviceUrl}ping` : `${serviceUrl}/ping`;
+
+    // Ping every 8 minutes (Render sleeps after 15 mins of inactivity)
+    setInterval(() => {
+        try {
+            const clientHttp = pingUrl.startsWith('https') ? https : http;
+            clientHttp.get(pingUrl, (res) => {
+                console.log(`[Keep-Alive] Self-ping successful (${res.statusCode}) at ${new Date().toLocaleTimeString()}`);
+            }).on('error', (err) => {
+                console.warn(`[Keep-Alive] Ping error:`, err.message);
+            });
+        } catch (e) {
+            console.warn(`[Keep-Alive] Ping execution error:`, e.message);
+        }
+    }, 8 * 60 * 1000);
+}
+
 
 const { 
     Client, 
