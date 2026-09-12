@@ -454,11 +454,14 @@ function saveMatchToDb(match) {
             promptMessageId: match.promptMessageId,
             lobbyMessageId: match.lobbyMessageId,
             threadId: match.threadId,
+            parentChannelId: match.parentChannelId,
             matchChannelId: match.matchChannelId || match.threadId,
             team1VoiceId: match.team1VoiceId,
             team2VoiceId: match.team2VoiceId,
             winnerVotes: Array.from(match.winnerVotes?.entries() || []),
             loserVotes: Array.from(match.loserVotes?.entries() || []),
+            cancelVotes: Array.from(match.cancelVotes || []),
+            cancelInitiatorId: match.cancelInitiatorId || null,
             votingCompleted: match.votingCompleted || false
         };
         db.run(`INSERT OR REPLACE INTO active_matches (matchId, data) VALUES (?, ?)`, [match.id, JSON.stringify(serializable)]);
@@ -481,6 +484,7 @@ function loadMatchesFromDb() {
                     parsed.originalVoiceChannels = new Map(parsed.originalVoiceChannels || []);
                     parsed.winnerVotes = new Map(parsed.winnerVotes || []);
                     parsed.loserVotes = new Map(parsed.loserVotes || []);
+                    parsed.cancelVotes = new Set(parsed.cancelVotes || []);
                     activeMatches.set(parsed.id, parsed);
                 } catch (e) {}
             }
@@ -555,7 +559,7 @@ function updateMatchStats(guildId, winners, losers, mvpWinnerId, mvpLoserId, hos
     });
 }
 
-// تنظيف صلاحيات الفويس وإعادة إغلاق الرومات للاعبين
+// تنظيف صلاحيات الفويس والشات وإعادة إغلاق الرومات للاعبين
 async function cleanupMatchVoicePermissions(guild, match) {
     if (!guild || !match) return;
     try {
@@ -575,8 +579,19 @@ async function cleanupMatchVoicePermissions(guild, match) {
                 }
             }
         }
+        // تنظيف صلاحيات القناة الأم للثريد إن وجدت
+        const parentId = match.parentChannelId;
+        if (parentId) {
+            const parentCh = guild.channels.cache.get(parentId) || await guild.channels.fetch(parentId).catch(() => null);
+            if (parentCh && parentCh.permissionOverwrites) {
+                const allPlayers = [...(match.team1 || []), ...(match.team2 || [])];
+                for (const uid of allPlayers) {
+                    await parentCh.permissionOverwrites.delete(uid).catch(() => {});
+                }
+            }
+        }
     } catch (e) {
-        console.error('Error cleaning up match voice permissions:', e);
+        console.error('Error cleaning up match voice and channel permissions:', e);
     }
 }
 
@@ -873,6 +888,41 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             const durationSec = Math.floor((Date.now() - joinTime) / 1000);
             voiceJoinTimes.delete(key);
             db.run(`UPDATE users SET voiceTime = voiceTime + ? WHERE userId = ? AND guildId = ?`, [durationSec, userId, guildId]);
+        }
+    }
+
+    // تفعيل وتأكيد صلاحيات الكتابة في الماتش للاعب عند دخوله إلى فويس فريقه (الغرفة الأولى أو الثانية)
+    if (newState.channelId && newState.guild) {
+        const activeMatch = Array.from(activeMatches.values()).find(m => 
+            m.guildId === newState.guild.id &&
+            (m.team1VoiceId === newState.channelId || m.team2VoiceId === newState.channelId) &&
+            ((m.team1 && m.team1.includes(userId)) || (m.team2 && m.team2.includes(userId))) &&
+            !m.votingCompleted
+        );
+
+        if (activeMatch) {
+            const parentChannelId = activeMatch.parentChannelId || activeMatch.channelId;
+            if (parentChannelId) {
+                const parentCh = newState.guild.channels.cache.get(parentChannelId) || await newState.guild.channels.fetch(parentChannelId).catch(() => null);
+                if (parentCh && parentCh.permissionOverwrites) {
+                    await parentCh.permissionOverwrites.edit(userId, {
+                        ViewChannel: true,
+                        SendMessages: true,
+                        SendMessagesInThreads: true,
+                        ReadMessageHistory: true,
+                        AttachFiles: true,
+                        EmbedLinks: true
+                    }).catch(() => {});
+                }
+            }
+
+            const threadId = activeMatch.matchChannelId || activeMatch.threadId;
+            if (threadId) {
+                const threadCh = newState.guild.channels.cache.get(threadId) || await newState.guild.channels.fetch(threadId).catch(() => null);
+                if (threadCh && threadCh.isThread()) {
+                    await threadCh.members.add(userId).catch(() => {});
+                }
+            }
         }
     }
 
@@ -1494,12 +1544,17 @@ client.on('messageCreate', async message => {
             promptMessageId: null,
             lobbyMessageId: null,
             threadId: null,
+            parentChannelId: null,
+            matchChannelId: null,
             team1VoiceId: null,
             team2VoiceId: null,
             infoTimeout: null,
             lobbyTimeout: null,
             winnerVotes: new Map(), // userId -> { voterTeam, winningTeam, mvpUid }
             loserVotes: new Map(),  // userId -> mvpLoserUid
+            cancelVotes: new Set(), // userIds who voted to cancel match
+            cancelInitiatorId: null,
+            cancelMessageId: null,
             votingCompleted: false
         };
 
@@ -2603,15 +2658,43 @@ client.on('interactionCreate', async interaction => {
 
                 // 7. إلغاء المباراة Cancel Match
                 if (selectedAction === 'cancel_match_request') {
-                    const cancelConfirmRow = new ActionRowBuilder().addComponents(
-                        new ButtonBuilder().setCustomId(`confirm_cancel_match_${match.id}`).setLabel('Confirm Cancel').setStyle(ButtonStyle.Danger),
-                        new ButtonBuilder().setCustomId(`keep_match_${match.id}`).setLabel('Keep Match').setStyle(ButtonStyle.Secondary)
-                    );
-                    await interaction.channel.send({
-                        content: `⚠️ **طلب إلغاء المباراة:** بدأ ${interaction.user} طلباً لإلغاء المباراة. هل تؤكد الإلغاء؟`,
-                        components: [cancelConfirmRow]
+                    if (!isParticipant && !isAdmin) {
+                        return interaction.editReply({ content: '❌ فقط اللاعبون المشاركون في هذه المباراة أو الإدارة يمكنهم طلب الإلغاء!' });
+                    }
+
+                    if (!match.cancelVotes) {
+                        match.cancelVotes = new Set();
+                    }
+
+                    // تسجيل صوت من بدأ الطلب فوراً
+                    match.cancelVotes.add(interaction.user.id);
+                    match.cancelInitiatorId = interaction.user.id;
+                    saveMatchToDb(match);
+
+                    const allPlayers = [...match.team1, ...match.team2];
+                    const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
+
+                    // إذا كان من طلب الإلغاء إدارياً، يتم الإلغاء فوراً
+                    if (isAdmin) {
+                        activeMatches.delete(match.id);
+                        removeMatchFromDb(match.id);
+                        await interaction.channel.send({ content: `🛑 **تم إلغاء المباراة رسمياً بواسطة الإدارة:** ${interaction.user}\n🔒 سيتم إعادة الجميع وحذف الروم خلال 5 ثوانٍ...` });
+                        await returnPlayersToWaiting(interaction.guild, match);
+                        await cleanupMatchVoicePermissions(interaction.guild, match);
+                        setTimeout(async () => {
+                            try { await interaction.channel.delete(); } catch (e) {}
+                        }, 5000);
+                        return interaction.editReply({ content: '✅ تم إلغاء المباراة بواسطة الإدارة.' });
+                    }
+
+                    const payload = buildCancelVotePayload(match, interaction.guild);
+                    const cancelMsg = await interaction.channel.send(payload);
+                    match.cancelMessageId = cancelMsg.id;
+                    saveMatchToDb(match);
+
+                    return interaction.editReply({ 
+                        content: `✅ تم بدء تصويت إلغاء المباراة وإرسال اللوحة في الشات! (الأصوات الحالية: 1/${requiredVotes}). يجب أن ينضم بقية اللاعبين للتصويت للموافقة.` 
                     });
-                    return interaction.editReply({ content: '✅ تم إرسال لوحة تأكيد إلغاء المباراة في الشات.' });
                 }
             }
 
@@ -2806,25 +2889,95 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            // تأكيد إلغاء المباراة
-            if (customId.startsWith('confirm_cancel_match_')) {
-                const match = findMatchFromInteraction(interaction, 'confirm_cancel_match_');
-                if (!match) return interaction.reply({ content: '❌ المباراة غير نشطة.', ephemeral: true });
+            // التصويت على إلغاء المباراة (Vote Cancel Button)
+            if (customId.startsWith('vote_cancel_') || customId.startsWith('confirm_cancel_match_')) {
+                const prefix = customId.startsWith('vote_cancel_') ? 'vote_cancel_' : 'confirm_cancel_match_';
+                const match = findMatchFromInteraction(interaction, prefix);
+                if (!match) return interaction.reply({ content: '❌ المباراة غير نشطة أو انتهت بالفعل.', ephemeral: true });
 
-                activeMatches.delete(match.id);
-                removeMatchFromDb(match.id);
+                const allPlayers = [...match.team1, ...match.team2];
+                const isParticipant = allPlayers.includes(interaction.user.id);
+                const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
 
-                await interaction.reply({ content: `🛑 **تم إلغاء المباراة رسمياً بناءً على طلب اللاعبين.**\n🔒 سيتم إعادة الجميع وحذف الروم خلال 5 ثوانٍ...` });
-                await returnPlayersToWaiting(interaction.guild, match);
-                await cleanupMatchVoicePermissions(interaction.guild, match);
-                setTimeout(async () => {
-                    try { await interaction.channel.delete(); } catch (e) {}
-                }, 5000);
+                if (!isParticipant && !isAdmin) {
+                    return interaction.reply({ content: '❌ فقط المشاركون في هذه المباراة أو الإدارة يمكنهم التصويت على الإلغاء!', ephemeral: true });
+                }
+
+                if (!match.cancelVotes) match.cancelVotes = new Set();
+
+                if (match.cancelVotes.has(interaction.user.id) && !isAdmin) {
+                    return interaction.reply({ content: '⚠️ لقد قمت بالتصويت لإلغاء المباراة بالفعل! في انتظار انضمام بقية اللاعبين للتصويت.', ephemeral: true });
+                }
+
+                match.cancelVotes.add(interaction.user.id);
+                saveMatchToDb(match);
+
+                const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
+
+                // إذا اكتمل النصاب المطلوب أو كان المصوت إدارياً
+                if (match.cancelVotes.size >= requiredVotes || isAdmin) {
+                    activeMatches.delete(match.id);
+                    removeMatchFromDb(match.id);
+
+                    const cancelEmbed = new EmbedBuilder()
+                        .setColor('#ed4245')
+                        .setTitle('🛑 تم إلغاء المباراة بالموافقة!')
+                        .setDescription(`تمت الموافقة على إلغاء المباراة رسمياً بناءً على اكتمال تصويت اللاعبين (${match.cancelVotes.size}/${requiredVotes}).\n🔒 سيتم إعادة الجميع إلى غرف الانتظار وحذف الروم خلال 5 ثوانٍ...`)
+                        .setTimestamp();
+
+                    if (!interaction.replied && !interaction.deferred) {
+                        await interaction.update({ embeds: [cancelEmbed], components: [] }).catch(() => {});
+                    } else {
+                        await interaction.channel.send({ embeds: [cancelEmbed] }).catch(() => {});
+                    }
+
+                    await returnPlayersToWaiting(interaction.guild, match);
+                    await cleanupMatchVoicePermissions(interaction.guild, match);
+
+                    setTimeout(async () => {
+                        try { await interaction.channel.delete(); } catch (e) {}
+                    }, 5000);
+                    return;
+                }
+
+                // تحديث اللوحة بالأصوات الجديدة
+                const payload = buildCancelVotePayload(match, interaction.guild);
+                await interaction.update(payload).catch(() => {});
                 return;
             }
 
             if (customId.startsWith('keep_match_')) {
-                return interaction.reply({ content: '✅ تم التراجع عن الإلغاء والاستمرار في المباراة.', ephemeral: true });
+                const match = findMatchFromInteraction(interaction, 'keep_match_');
+                if (!match) return interaction.reply({ content: '❌ هذه المباراة غير نشطة.', ephemeral: true });
+
+                const allPlayers = [...match.team1, ...match.team2];
+                const isParticipant = allPlayers.includes(interaction.user.id);
+                const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
+
+                if (!isParticipant && !isAdmin) {
+                    return interaction.reply({ content: '❌ فقط المشاركون في المباراة يمكنهم التفاعل مع اللوحة.', ephemeral: true });
+                }
+
+                // إذا كان صاحب الطلب أو الإدارة ضغط Keep Match يتم إلغاء التصويت والعودة للماتش
+                if (interaction.user.id === match.cancelInitiatorId || isAdmin) {
+                    match.cancelVotes = new Set();
+                    match.cancelInitiatorId = null;
+                    saveMatchToDb(match);
+
+                    const keepEmbed = new EmbedBuilder()
+                        .setColor('#57f287')
+                        .setTitle('🎮 استمرار المباراة!')
+                        .setDescription(`تم إلغاء طلب إنهاء المباراة بواسطة ${interaction.user}. استمتعوا باللعب!`)
+                        .setTimestamp();
+
+                    return interaction.update({ embeds: [keepEmbed], components: [] }).catch(() => {});
+                }
+
+                const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
+                return interaction.reply({ 
+                    content: `✅ صوتك محتسب للاستمرار في اللعب. لن يتم إلغاء المباراة إلا إذا اكتمل تصويت ${requiredVotes} لاعبين على الإلغاء.`, 
+                    ephemeral: true 
+                });
             }
 
         }
@@ -2842,6 +2995,52 @@ client.on('interactionCreate', async interaction => {
         }
     }
 });
+
+// دالة بناء رسالة تصويت إلغاء المباراة التفاعلية
+function buildCancelVotePayload(match, guild) {
+    const allPlayers = [...(match.team1 || []), ...(match.team2 || [])];
+    const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
+    const currentVotes = match.cancelVotes ? match.cancelVotes.size : 0;
+
+    const votersList = match.cancelVotes && match.cancelVotes.size > 0 
+        ? Array.from(match.cancelVotes).map(uid => `<@${uid}>`).join(', ') 
+        : 'None';
+    const t1Count = (match.team1 || []).filter(uid => match.cancelVotes?.has(uid)).length;
+    const t2Count = (match.team2 || []).filter(uid => match.cancelVotes?.has(uid)).length;
+
+    const initiatorId = match.cancelInitiatorId || (match.cancelVotes ? Array.from(match.cancelVotes)[0] : null);
+
+    const embed = new EmbedBuilder()
+        .setColor('#ed4245')
+        .setTitle('⚠️ تصويت إلغاء المباراة | Match Cancel Vote')
+        .setDescription(
+            `بدأ اللاعب <@${initiatorId}> طلباً لإلغاء هذه المباراة.\n` +
+            `لإلغاء المباراة، يجب أن يوافق **${requiredVotes}** لاعبين على الأقل بالضغط على زر التصويت أدناه.\n\n` +
+            `*يمكن لأعضاء كلا الفريقين الانضمام للتصويت.*`
+        )
+        .addFields(
+            { name: '📊 نسبة الأصوات', value: `**${currentVotes} / ${requiredVotes}** أصوات`, inline: true },
+            { name: '👥 حالة الفريقين', value: `🔴 Team 1: **${t1Count}/${match.team1.length}**\n🟢 Team 2: **${t2Count}/${match.team2.length}**`, inline: true },
+            { name: '🗳️ المصوتون للإلغاء', value: votersList, inline: false }
+        )
+        .setFooter({ text: 'Apostado Manager • Fair Play System' })
+        .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`vote_cancel_${match.id}`)
+            .setLabel(`Vote Cancel (${currentVotes}/${requiredVotes})`)
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('🛑'),
+        new ButtonBuilder()
+            .setCustomId(`keep_match_${match.id}`)
+            .setLabel('Keep Match')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('🎮')
+    );
+
+    return { embeds: [embed], components: [row] };
+}
 
 // دالة بناء قائمة تصويت الفائز (CHOSE THE MVP - Stage 1)
 function buildWinnerSelectMenu(match, guild) {
@@ -3200,6 +3399,19 @@ async function startMatch(guild, match) {
             (c.name.toLowerCase().includes('paradis') || c.name.toLowerCase().includes('partida'))
         );
         const threadParentChannel = paradisChannel || playChannel;
+        match.parentChannelId = threadParentChannel.id;
+
+        // تطبيق صلاحيات القراءة والكتابة في الثريد لجميع لاعبي الفريقين (Team 1 و Team 2) على القناة الأم لضمان قدرتهم على الكتابة فوراً
+        for (const uid of allParticipants) {
+            await threadParentChannel.permissionOverwrites.edit(uid, {
+                ViewChannel: true,
+                SendMessages: true,
+                SendMessagesInThreads: true,
+                ReadMessageHistory: true,
+                AttachFiles: true,
+                EmbedLinks: true
+            }).catch(e => console.error(`Error adding threadParentChannel perms for ${uid}:`, e));
+        }
 
         let matchChannel;
         try {
