@@ -3127,7 +3127,9 @@ client.on('interactionCreate', async interaction => {
 
                 // تحديث اللوحة بالأصوات الجديدة
                 const payload = buildCancelVotePayload(match, interaction.guild);
-                await interaction.editReply(payload).catch(() => {});
+                await interaction.editReply(payload).catch(async () => {
+                    await interaction.message?.edit(payload).catch(() => {});
+                });
                 return;
             }
 
@@ -3166,7 +3168,9 @@ client.on('interactionCreate', async interaction => {
                         .setDescription(`تم إلغاء طلب إنهاء المباراة بواسطة ${interaction.user}. استمتعوا باللعب!`)
                         .setTimestamp();
 
-                    return interaction.editReply({ embeds: [keepEmbed], components: [] }).catch(() => {});
+                    return interaction.editReply({ embeds: [keepEmbed], components: [] }).catch(async () => {
+                        await interaction.message?.edit({ embeds: [keepEmbed], components: [] }).catch(() => {});
+                    });
                 }
 
                 const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
