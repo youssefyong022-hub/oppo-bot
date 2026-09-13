@@ -499,6 +499,42 @@ function loadMatchesFromDb() {
                     parsed.winnerVotingConcluded = parsed.winnerVotingConcluded || false;
                     parsed.loserVotingActive = parsed.loserVotingActive || false;
                     parsed.cancelVoteActive = parsed.cancelVoteActive || false;
+
+                    if (parsed.state === 'WAITING_INFO') {
+                        removeMatchFromDb(parsed.id);
+                        continue;
+                    }
+
+                    if (parsed.state === 'LOBBY') {
+                        parsed.lobbyTimeout = setTimeout(async () => {
+                            const currentMatch = activeMatches.get(parsed.id);
+                            if (currentMatch && currentMatch.state === 'LOBBY') {
+                                activeMatches.delete(parsed.id);
+                                removeMatchFromDb(parsed.id);
+                                try {
+                                    const guild = client.guilds.cache.get(currentMatch.guildId);
+                                    if (guild && currentMatch.channelId && currentMatch.lobbyMessageId) {
+                                        const ch = await guild.channels.fetch(currentMatch.channelId).catch(() => null);
+                                        if (ch) {
+                                            const msg = await ch.messages.fetch(currentMatch.lobbyMessageId).catch(() => null);
+                                            if (msg) {
+                                                const timeoutEmbed = new EmbedBuilder()
+                                                    .setColor(0xED4245)
+                                                    .setTitle('❌ Match Cancelled - Timeout')
+                                                    .setDescription(`**${currentMatch.mode}** match created by <@${currentMatch.hostId}> was automatically cancelled.\n\n⏰ Reason: Teams did not fill up within 5 minutes.\n\nUse \`!play ${currentMatch.mode.toLowerCase()}\` to start a new match.`)
+                                                    .setFooter({ text: new Date().toLocaleString() });
+                                                const expiredRow = new ActionRowBuilder().addComponents(
+                                                    new ButtonBuilder().setCustomId('expired_btn').setLabel('Match Expired').setStyle(ButtonStyle.Secondary).setDisabled(true)
+                                                );
+                                                await msg.edit({ embeds: [timeoutEmbed], components: [expiredRow] }).catch(() => {});
+                                            }
+                                        }
+                                    }
+                                } catch (e) {}
+                            }
+                        }, 300000);
+                    }
+
                     activeMatches.set(parsed.id, parsed);
                 } catch (e) {}
             }
@@ -607,6 +643,99 @@ async function cleanupMatchVoicePermissions(guild, match) {
     } catch (e) {
         console.error('Error cleaning up match voice and channel permissions:', e);
     }
+}
+
+// دالة شاملة لتنظيف وإعادة ضبط جميع المباريات المعلقة والرسائل العالقة في السيرفر
+async function clearAllMatches(guild, executorUser, currentChannel = null) {
+    if (!guild) return { matchCount: 0, strandedCount: 0 };
+
+    let matchCount = 0;
+    let strandedCount = 0;
+
+    // 1. تنظيف المباريات النشطة في الذاكرة
+    for (const [id, m] of activeMatches.entries()) {
+        if (m.guildId === guild.id) {
+            matchCount++;
+            if (m.lobbyTimeout) clearTimeout(m.lobbyTimeout);
+            if (m.infoTimeout) clearTimeout(m.infoTimeout);
+
+            // تعطيل رسالة اللوبي إذا كانت موجودة
+            if (m.channelId && m.lobbyMessageId) {
+                try {
+                    const playCh = await guild.channels.fetch(m.channelId).catch(() => null);
+                    if (playCh) {
+                        const lobbyMsg = await playCh.messages.fetch(m.lobbyMessageId).catch(() => null);
+                        if (lobbyMsg) {
+                            const cancelEmbed = new EmbedBuilder()
+                                .setColor(0xED4245)
+                                .setTitle('✖ Match Cancelled')
+                                .setDescription(`This match was cancelled by administrator <@${executorUser.id}>.\n\nUse \`!play\` to start a new match.`)
+                                .setFooter({ text: new Date().toLocaleString() });
+                            await lobbyMsg.edit({ embeds: [cancelEmbed], components: [] }).catch(() => {});
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            // حذف قناة/ثريد الماتش إن وجد
+            const matchChId = m.matchChannelId || m.threadId;
+            if (matchChId) {
+                try {
+                    const ch = await guild.channels.fetch(matchChId).catch(() => null);
+                    if (ch) await ch.delete('Match cleared by admin').catch(() => {});
+                } catch (e) {}
+            }
+
+            // إعادة اللاعبين للانتظار وتنظيف الصلاحيات
+            await returnPlayersToWaiting(guild, m).catch(() => {});
+            await cleanupMatchVoicePermissions(guild, m).catch(() => {});
+
+            activeMatches.delete(id);
+            removeMatchFromDb(id);
+        }
+    }
+
+    // 2. تنظيف قاعدة البيانات تحسباً لأي مباريات قديمة معلقة
+    try {
+        db.run(`DELETE FROM active_matches WHERE data LIKE ?`, [`%"guildId":"${guild.id}"%`]);
+    } catch (e) {}
+
+    // 3. مسح وتعطيل أي رسائل لوبي عالقة في القناة الحالية أو قنوات اللعب المعتمدة
+    const channelsToCheck = new Set();
+    if (currentChannel) channelsToCheck.add(currentChannel);
+    guild.channels.cache.filter(c => isAllowedPlayChannel(c)).forEach(c => channelsToCheck.add(c));
+
+    for (const ch of channelsToCheck) {
+        if (!ch || !ch.messages) continue;
+        try {
+            const messages = await ch.messages.fetch({ limit: 25 }).catch(() => null);
+            if (messages) {
+                for (const msg of messages.values()) {
+                    if (msg.author.id === client.user.id && msg.components?.length > 0) {
+                        const hasMatchButton = msg.components.some(row => 
+                            row.components.some(comp => 
+                                comp.customId?.startsWith('join_team') || 
+                                comp.customId?.startsWith('cancel_match_') ||
+                                comp.customId?.startsWith('enter_room_info_') ||
+                                comp.customId?.startsWith('leave_match_')
+                            )
+                        );
+                        if (hasMatchButton) {
+                            const disabledRows = msg.components.map(row => {
+                                const newRow = ActionRowBuilder.from(row);
+                                newRow.components.forEach(c => c.setDisabled(true));
+                                return newRow;
+                            });
+                            await msg.edit({ components: disabledRows }).catch(() => {});
+                            strandedCount++;
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+    }
+
+    return { matchCount, strandedCount };
 }
 
 // دالة إنهاء المباراة وتوزيع النقاط وإغلاق الروم
@@ -1354,16 +1483,8 @@ client.on('messageCreate', async message => {
             return message.reply('❌ هذا الأمر مخصص لطاقم الإدارة فقط!');
         }
 
-        let count = 0;
-        for (const [id, m] of activeMatches.entries()) {
-            if (m.guildId === guildId) {
-                activeMatches.delete(id);
-                removeMatchFromDb(id);
-                count++;
-            }
-        }
-
-        return message.reply(`🧹 **تم تنظيف جميع المباريات المعلقة (${count}) وفك التعليق عن جميع اللاعبين في السيرفر بنجاح!**`);
+        const { matchCount, strandedCount } = await clearAllMatches(message.guild, message.author, message.channel);
+        return message.reply(`🧹 **تم تنظيف جميع المباريات المعلقة (${matchCount}) وتعطيل (${strandedCount}) رسالة لوبي معلقة وفك التعليق عن جميع اللاعبين في السيرفر بنجاح!**`);
     }
 
     // أمر تعيين MVP Winner للإدارة !w
@@ -1627,12 +1748,14 @@ client.on('messageCreate', async message => {
 
         const promptMsg = await message.reply({ embeds: [createEmbed], components: [row] });
         match.promptMessageId = promptMsg.id;
+        saveMatchToDb(match);
 
         // مهلة 30 ثانية لإدخال معلومات الروم
         match.infoTimeout = setTimeout(async () => {
             const currentMatch = activeMatches.get(matchId);
             if (currentMatch && currentMatch.state === 'WAITING_INFO') {
                 activeMatches.delete(matchId);
+                removeMatchFromDb(matchId);
                 const timeoutEmbed = new EmbedBuilder()
                     .setColor('#2b2d31')
                     .setDescription(`You didn't enter room information within 30 seconds\n\nMode: ${match.mode}\nUse \`!play ${modeArg}\` to try again.`)
@@ -1967,16 +2090,9 @@ client.on('interactionCreate', async interaction => {
                 if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
                     return interaction.reply({ content: '❌ هذا الأمر مخصص للإدارة فقط!', ephemeral: true });
                 }
-                const guildId = interaction.guild.id;
-                let count = 0;
-                for (const [id, m] of activeMatches.entries()) {
-                    if (m.guildId === guildId) {
-                        activeMatches.delete(id);
-                        removeMatchFromDb(id);
-                        count++;
-                    }
-                }
-                return interaction.reply({ content: `🧹 **تم تنظيف جميع المباريات المعلقة (${count}) وفك التعليق عن جميع لاعبي السيرفر بنجاح!**` });
+                await interaction.deferReply();
+                const { matchCount, strandedCount } = await clearAllMatches(interaction.guild, interaction.user, interaction.channel);
+                return interaction.editReply({ content: `🧹 **تم تنظيف جميع المباريات المعلقة (${matchCount}) وتعطيل (${strandedCount}) رسالة لوبي معلقة وفك التعليق عن جميع لاعبي السيرفر بنجاح!**` });
             }
 
             if (commandName === 'move') {
@@ -2111,7 +2227,17 @@ client.on('interactionCreate', async interaction => {
                 const match = findMatchFromInteraction(interaction, isTeam1 ? 'join_team1_' : 'join_team2_');
 
                 if (!match || match.state !== 'LOBBY') {
-                    return interaction.reply({ content: '❌ هذه المباراة لم تعد متاحة للانضمام.', ephemeral: true });
+                    if (interaction.message && interaction.message.editable) {
+                        try {
+                            const disabledRows = interaction.message.components.map(row => {
+                                const newRow = ActionRowBuilder.from(row);
+                                newRow.components.forEach(c => c.setDisabled(true));
+                                return newRow;
+                            });
+                            await interaction.message.edit({ components: disabledRows }).catch(() => {});
+                        } catch (e) {}
+                    }
+                    return interaction.reply({ content: '❌ هذه المباراة لم تعد متاحة للانضمام أو انتهت صلاحيتها.', ephemeral: true });
                 }
 
                 // التحقق الدقيق: يجب أن يكون اللاعب داخل إحدى غرف الانتظار (waiting)
@@ -2148,12 +2274,23 @@ client.on('interactionCreate', async interaction => {
                 const match = findMatchFromInteraction(interaction, 'leave_match_');
 
                 if (!match || match.state !== 'LOBBY') {
+                    if (interaction.message && interaction.message.editable) {
+                        try {
+                            const disabledRows = interaction.message.components.map(row => {
+                                const newRow = ActionRowBuilder.from(row);
+                                newRow.components.forEach(c => c.setDisabled(true));
+                                return newRow;
+                            });
+                            await interaction.message.edit({ components: disabledRows }).catch(() => {});
+                        } catch (e) {}
+                    }
                     return interaction.reply({ content: '❌ هذه المباراة لم تعد نشطة.', ephemeral: true });
                 }
 
                 const uid = interaction.user.id;
                 match.team1 = match.team1.filter(id => id !== uid);
                 match.team2 = match.team2.filter(id => id !== uid);
+                saveMatchToDb(match);
 
                 await updateLobbyMessage(interaction.guild, match);
                 return interaction.reply({ content: '✅ لقد غادرت التشكيلة بنجاح.', ephemeral: true });
@@ -2162,7 +2299,9 @@ client.on('interactionCreate', async interaction => {
             // إلغاء المباراة من قبل الهوست
             if (customId.startsWith('cancel_match_')) {
                 const lockKey = `${interaction.user.id}_${customId}`;
-                if (actionDebounceLocks.has(lockKey)) return;
+                if (actionDebounceLocks.has(lockKey)) {
+                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية...', ephemeral: true }).catch(() => {});
+                }
                 actionDebounceLocks.add(lockKey);
                 setTimeout(() => actionDebounceLocks.delete(lockKey), 3000);
 
@@ -2171,6 +2310,16 @@ client.on('interactionCreate', async interaction => {
                 const match = findMatchFromInteraction(interaction, 'cancel_match_');
 
                 if (!match) {
+                    if (interaction.message && interaction.message.editable) {
+                        try {
+                            const disabledRows = interaction.message.components.map(row => {
+                                const newRow = ActionRowBuilder.from(row);
+                                newRow.components.forEach(c => c.setDisabled(true));
+                                return newRow;
+                            });
+                            await interaction.message.edit({ components: disabledRows }).catch(() => {});
+                        } catch (e) {}
+                    }
                     return interaction.editReply({ content: '❌ هذه المباراة غير موجودة أو تم إلغاؤها بالفعل.' });
                 }
 
@@ -2563,8 +2712,9 @@ client.on('interactionCreate', async interaction => {
                 });
 
                 match.lobbyMessageId = lobbyMsg.id;
+                saveMatchToDb(match);
 
-                // مؤقت دقيقتين لملء الفرق (2 Minutes Timeout)
+                // مؤقت 5 دقائق لملء الفرق (5 Minutes Timeout)
                 const matchId = match.id;
                 match.lobbyTimeout = setTimeout(async () => {
                     const currentMatch = activeMatches.get(matchId);
@@ -2575,16 +2725,24 @@ client.on('interactionCreate', async interaction => {
                         const timeoutEmbed = new EmbedBuilder()
                             .setColor(0xED4245)
                             .setTitle('❌ Match Cancelled - Timeout')
-                            .setDescription(`**${match.mode}** match created by <@${match.hostId}> was automatically cancelled.\n\n⏰ **Reason:** Teams did not fill up within 2 minutes.\n\nUse \`!play ${match.mode.toLowerCase()}\` to start a new match.`)
+                            .setDescription(`**${match.mode}** match created by <@${match.hostId}> was automatically cancelled.\n\n⏰ **Reason:** Teams did not fill up within 5 minutes.\n\nUse \`!play ${match.mode.toLowerCase()}\` to start a new match.`)
                             .setFooter({ text: new Date().toLocaleString() });
 
                         const expiredRow = new ActionRowBuilder().addComponents(
                             new ButtonBuilder().setCustomId('expired_btn').setLabel('Match Expired').setStyle(ButtonStyle.Secondary).setDisabled(true)
                         );
 
-                        await lobbyMsg.edit({ embeds: [timeoutEmbed], components: [expiredRow] }).catch(() => {});
+                        try {
+                            const ch = await interaction.guild.channels.fetch(match.channelId).catch(() => null);
+                            if (ch && match.lobbyMessageId) {
+                                const msg = await ch.messages.fetch(match.lobbyMessageId).catch(() => null);
+                                if (msg) {
+                                    await msg.edit({ embeds: [timeoutEmbed], components: [expiredRow] }).catch(() => {});
+                                }
+                            }
+                        } catch (e) {}
                     }
-                }, 120000);
+                }, 300000);
             }
 
             // التحقق من البرايفت كي عند الانضمام
@@ -2854,7 +3012,9 @@ client.on('interactionCreate', async interaction => {
             // استقبال صوت الفائز والـ MVP (المرحلة 1)
             if (customId.startsWith('vote_winner_mvp_select_')) {
                 const lockKey = `${interaction.user.id}_${customId}`;
-                if (actionDebounceLocks.has(lockKey)) return;
+                if (actionDebounceLocks.has(lockKey)) {
+                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية قبل المحاولة مجدداً...', ephemeral: true }).catch(() => {});
+                }
                 actionDebounceLocks.add(lockKey);
                 setTimeout(() => actionDebounceLocks.delete(lockKey), 2000);
 
@@ -2963,7 +3123,9 @@ client.on('interactionCreate', async interaction => {
             // استقبال صوت MVP الخاسر (المرحلة 2)
             if (customId.startsWith('vote_loser_mvp_select_')) {
                 const lockKey = `${interaction.user.id}_${customId}`;
-                if (actionDebounceLocks.has(lockKey)) return;
+                if (actionDebounceLocks.has(lockKey)) {
+                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية قبل المحاولة مجدداً...', ephemeral: true }).catch(() => {});
+                }
                 actionDebounceLocks.add(lockKey);
                 setTimeout(() => actionDebounceLocks.delete(lockKey), 2000);
 
@@ -3069,7 +3231,9 @@ client.on('interactionCreate', async interaction => {
             // التصويت على إلغاء المباراة (Vote Cancel Button)
             if (customId.startsWith('vote_cancel_') || customId.startsWith('confirm_cancel_match_')) {
                 const lockKey = `${interaction.user.id}_${customId}`;
-                if (actionDebounceLocks.has(lockKey)) return;
+                if (actionDebounceLocks.has(lockKey)) {
+                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية...', ephemeral: true }).catch(() => {});
+                }
                 actionDebounceLocks.add(lockKey);
                 setTimeout(() => actionDebounceLocks.delete(lockKey), 3000);
 
@@ -3135,7 +3299,9 @@ client.on('interactionCreate', async interaction => {
 
             if (customId.startsWith('keep_match_')) {
                 const lockKey = `${interaction.user.id}_${customId}`;
-                if (actionDebounceLocks.has(lockKey)) return;
+                if (actionDebounceLocks.has(lockKey)) {
+                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية...', ephemeral: true }).catch(() => {});
+                }
                 actionDebounceLocks.add(lockKey);
                 setTimeout(() => actionDebounceLocks.delete(lockKey), 3000);
 
@@ -3190,7 +3356,9 @@ client.on('interactionCreate', async interaction => {
 
     } catch (err) {
         console.error('Interaction error:', err);
-        if (!interaction.replied && !interaction.deferred) {
+        if (interaction.deferred) {
+            interaction.editReply({ content: '❌ حدث خطأ غير متوقع أثناء معالجة الطلب.' }).catch(() => {});
+        } else if (!interaction.replied) {
             interaction.reply({ content: '❌ حدث خطأ غير متوقع أثناء معالجة الطلب.', ephemeral: true }).catch(() => {});
         }
     }
