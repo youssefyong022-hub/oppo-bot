@@ -710,6 +710,16 @@ client.on('channelDelete', (channel) => {
     }
 });
 
+client.on('threadDelete', (thread) => {
+    for (const match of activeMatches.values()) {
+        if (match.matchChannelId === thread.id || match.threadId === thread.id || match.channelId === thread.id) {
+            activeMatches.delete(match.id);
+            removeMatchFromDb(match.id);
+            console.log(`Auto-cleaned match ${match.id} because thread ${thread.id} was deleted.`);
+        }
+    }
+});
+
 // دوال مساعدة لقاعدة البيانات
 function getUserStats(userId, guildId) {
     return new Promise((resolve, reject) => {
@@ -2805,6 +2815,148 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
+            // التصويت على إلغاء المباراة (Vote Cancel Button)
+            if (customId.startsWith('vote_cancel_') || customId.startsWith('confirm_cancel_match_')) {
+                const lockKey = `${interaction.user.id}_${customId}`;
+                if (actionDebounceLocks.has(lockKey)) {
+                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية...', ephemeral: true }).catch(() => {});
+                }
+                actionDebounceLocks.add(lockKey);
+                setTimeout(() => actionDebounceLocks.delete(lockKey), 1500);
+
+                // استجابة فورية للديسكورد لمنع حدوث BOT did not respond in time
+                await interaction.deferUpdate().catch(() => {});
+
+                const prefix = customId.startsWith('vote_cancel_') ? 'vote_cancel_' : 'confirm_cancel_match_';
+                const match = findMatchFromInteraction(interaction, prefix);
+                if (!match) {
+                    return interaction.followUp({ content: '❌ المباراة غير نشطة أو انتهت بالفعل.', ephemeral: true }).catch(() => {});
+                }
+
+                const allPlayers = [...(match.team1 || []), ...(match.team2 || [])];
+                const isParticipant = allPlayers.includes(interaction.user.id);
+                const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
+
+                if (!isParticipant && !isAdmin) {
+                    return interaction.followUp({ content: '❌ فقط المشاركون في هذه المباراة أو الإدارة يمكنهم التصويت على الإلغاء!', ephemeral: true }).catch(() => {});
+                }
+
+                if (!match.cancelVotes) match.cancelVotes = new Set();
+
+                if (match.cancelVotes.has(interaction.user.id) && !isAdmin) {
+                    return interaction.followUp({ content: '⚠️ لقد قمت بالتصويت لإلغاء المباراة بالفعل! في انتظار انضمام بقية اللاعبين للتصويت.', ephemeral: true }).catch(() => {});
+                }
+
+                match.cancelVotes.add(interaction.user.id);
+                saveMatchToDb(match);
+
+                const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
+
+                // إذا اكتمل النصاب المطلوب أو كان المصوت إدارياً
+                if (match.cancelVotes.size >= requiredVotes || isAdmin) {
+                    activeMatches.delete(match.id);
+                    removeMatchFromDb(match.id);
+
+                    const cancelEmbed = new EmbedBuilder()
+                        .setColor('#ed4245')
+                        .setTitle('🛑 تم إلغاء المباراة بالموافقة!')
+                        .setDescription(`تمت الموافقة على إلغاء المباراة رسمياً بناءً على اكتمال تصويت اللاعبين (${match.cancelVotes.size}/${requiredVotes}).\n🔒 سيتم إعادة الجميع إلى غرف الانتظار وحذف الروم خلال 5 ثوانٍ...`)
+                        .setTimestamp();
+
+                    await interaction.editReply({ embeds: [cancelEmbed], components: [] }).catch(async () => {
+                        await interaction.channel.send({ embeds: [cancelEmbed] }).catch(() => {});
+                    });
+
+                    await interaction.channel.send({
+                        content: `🛑 **تم إلغاء المباراة رسمياً!** لاكتمال تصويت اللاعبين (${match.cancelVotes.size}/${requiredVotes}). سيتم حذف القناة وإعادة اللاعبين.`
+                    }).catch(() => {});
+
+                    await returnPlayersToWaiting(interaction.guild, match);
+                    await cleanupMatchVoicePermissions(interaction.guild, match);
+
+                    setTimeout(async () => {
+                        try { await interaction.channel.delete(); } catch (e) {}
+                    }, 5000);
+                    return;
+                }
+
+                // تحديث اللوحة بالأصوات الجديدة
+                const payload = buildCancelVotePayload(match, interaction.guild);
+                await interaction.editReply(payload).catch(async () => {
+                    await interaction.message?.edit(payload).catch(() => {});
+                });
+
+                await interaction.followUp({
+                    content: `✅ تم تسجيل صوتك لإلغاء المباراة بنجاح! (${match.cancelVotes.size}/${requiredVotes} أصوات حتى الآن)`,
+                    ephemeral: true
+                }).catch(() => {});
+                return;
+            }
+
+            // زر الاستمرار في اللعب وإلغاء طلب الإنهاء (Keep Match Button)
+            if (customId.startsWith('keep_match_')) {
+                const lockKey = `${interaction.user.id}_${customId}`;
+                if (actionDebounceLocks.has(lockKey)) {
+                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية...', ephemeral: true }).catch(() => {});
+                }
+                actionDebounceLocks.add(lockKey);
+                setTimeout(() => actionDebounceLocks.delete(lockKey), 1500);
+
+                await interaction.deferUpdate().catch(() => {});
+
+                const match = findMatchFromInteraction(interaction, 'keep_match_');
+                if (!match) {
+                    return interaction.followUp({ content: '❌ هذه المباراة غير نشطة.', ephemeral: true }).catch(() => {});
+                }
+
+                const allPlayers = [...(match.team1 || []), ...(match.team2 || [])];
+                const isParticipant = allPlayers.includes(interaction.user.id);
+                const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
+
+                if (!isParticipant && !isAdmin) {
+                    return interaction.followUp({ content: '❌ فقط المشاركون في المباراة يمكنهم التفاعل مع اللوحة.', ephemeral: true }).catch(() => {});
+                }
+
+                // إذا كان صاحب الطلب أو الإدارة ضغط Keep Match يتم إلغاء التصويت والعودة للماتش
+                if (interaction.user.id === match.cancelInitiatorId || isAdmin) {
+                    match.cancelVotes = new Set();
+                    match.cancelInitiatorId = null;
+                    match.cancelVoteActive = false;
+                    match.cancelMessageId = null;
+                    saveMatchToDb(match);
+
+                    const keepEmbed = new EmbedBuilder()
+                        .setColor('#57f287')
+                        .setTitle('🎮 استمرار المباراة!')
+                        .setDescription(`تم إلغاء طلب إنهاء المباراة بواسطة ${interaction.user}. استمتعوا باللعب!`)
+                        .setTimestamp();
+
+                    return interaction.editReply({ embeds: [keepEmbed], components: [] }).catch(async () => {
+                        await interaction.message?.edit({ embeds: [keepEmbed], components: [] }).catch(() => {});
+                    });
+                }
+
+                // إذا كان لاعباً آخر صوت سابقاً بالـ cancel ويريد التراجع
+                if (match.cancelVotes && match.cancelVotes.has(interaction.user.id)) {
+                    match.cancelVotes.delete(interaction.user.id);
+                    saveMatchToDb(match);
+                    const payload = buildCancelVotePayload(match, interaction.guild);
+                    await interaction.editReply(payload).catch(async () => {
+                        await interaction.message?.edit(payload).catch(() => {});
+                    });
+                    return interaction.followUp({
+                        content: '↩️ تم سحب صوتك لإلغاء المباراة بنجاح.',
+                        ephemeral: true
+                    }).catch(() => {});
+                }
+
+                const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
+                return interaction.followUp({ 
+                    content: `✅ صوتك محتسب للاستمرار في اللعب. لن يتم إلغاء المباراة إلا إذا اكتمل تصويت ${requiredVotes} لاعبين على الإلغاء.`, 
+                    ephemeral: true 
+                }).catch(() => {});
+            }
+
             // أزرار التذاكر وفحص اللاعبين
             if (customId === 'create_ticket_help' || customId === 'create_ticket_abuse') {
                 await interaction.deferReply({ ephemeral: true });
@@ -3372,11 +3524,13 @@ client.on('interactionCreate', async interaction => {
                         match.cancelVotes = new Set();
                     }
 
-                    const allPlayers = [...match.team1, ...match.team2];
+                    const allPlayers = [...(match.team1 || []), ...(match.team2 || [])];
                     const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
 
                     // إذا كان هناك تصويت إلغاء نشط بالفعل
-                    if (match.cancelVoteActive && match.cancelMessageId) {
+                    if (match.cancelVoteActive) {
+                        if (!match.cancelVotes) match.cancelVotes = new Set();
+
                         if (match.cancelVotes.has(interaction.user.id)) {
                             return interaction.editReply({ 
                                 content: `⚠️ **هناك تصويت نشط بالفعل لإلغاء المباراة بالأعلى!**\nوأنت قمت بالتصويت مسبقاً (${match.cancelVotes.size}/${requiredVotes}). في انتظار انضمام بقية اللاعبين.` 
@@ -3397,6 +3551,15 @@ client.on('interactionCreate', async interaction => {
                                 .setDescription(`تمت الموافقة على إلغاء المباراة رسمياً بناءً على اكتمال تصويت اللاعبين (${match.cancelVotes.size}/${requiredVotes}).\n🔒 سيتم إعادة الجميع وحذف الروم خلال 5 ثوانٍ...`)
                                 .setTimestamp();
 
+                            if (match.cancelMessageId) {
+                                try {
+                                    const cancelMsg = await interaction.channel.messages.fetch(match.cancelMessageId).catch(() => null);
+                                    if (cancelMsg) {
+                                        await cancelMsg.edit({ embeds: [cancelEmbed], components: [] }).catch(() => {});
+                                    }
+                                } catch (e) {}
+                            }
+
                             await interaction.channel.send({ embeds: [cancelEmbed] }).catch(() => {});
                             await returnPlayersToWaiting(interaction.guild, match);
                             await cleanupMatchVoicePermissions(interaction.guild, match);
@@ -3407,13 +3570,15 @@ client.on('interactionCreate', async interaction => {
                         }
 
                         // تحديث لوحة التصويت القائمة بالأعلى
-                        try {
-                            const cancelMsg = await interaction.channel.messages.fetch(match.cancelMessageId).catch(() => null);
-                            if (cancelMsg) {
-                                const payload = buildCancelVotePayload(match, interaction.guild);
-                                await cancelMsg.edit(payload);
-                            }
-                        } catch (e) {}
+                        if (match.cancelMessageId) {
+                            try {
+                                const cancelMsg = await interaction.channel.messages.fetch(match.cancelMessageId).catch(() => null);
+                                if (cancelMsg) {
+                                    const payload = buildCancelVotePayload(match, interaction.guild);
+                                    await cancelMsg.edit(payload);
+                                }
+                            } catch (e) {}
+                        }
 
                         return interaction.editReply({ 
                             content: `✅ تم تسجيل صوتك لإلغاء المباراة ضمن التصويت النشط بالأعلى! (الأصوات: ${match.cancelVotes.size}/${requiredVotes}).` 
@@ -3656,124 +3821,6 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            // التصويت على إلغاء المباراة (Vote Cancel Button)
-            if (customId.startsWith('vote_cancel_') || customId.startsWith('confirm_cancel_match_')) {
-                const lockKey = `${interaction.user.id}_${customId}`;
-                if (actionDebounceLocks.has(lockKey)) {
-                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية...', ephemeral: true }).catch(() => {});
-                }
-                actionDebounceLocks.add(lockKey);
-                setTimeout(() => actionDebounceLocks.delete(lockKey), 3000);
-
-                // استجابة فورية للديسكورد لمنع حدوث BOT did not respond in time
-                await interaction.deferUpdate().catch(() => {});
-
-                const prefix = customId.startsWith('vote_cancel_') ? 'vote_cancel_' : 'confirm_cancel_match_';
-                const match = findMatchFromInteraction(interaction, prefix);
-                if (!match) {
-                    return interaction.followUp({ content: '❌ المباراة غير نشطة أو انتهت بالفعل.', ephemeral: true }).catch(() => {});
-                }
-
-                const allPlayers = [...match.team1, ...match.team2];
-                const isParticipant = allPlayers.includes(interaction.user.id);
-                const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
-
-                if (!isParticipant && !isAdmin) {
-                    return interaction.followUp({ content: '❌ فقط المشاركون في هذه المباراة أو الإدارة يمكنهم التصويت على الإلغاء!', ephemeral: true }).catch(() => {});
-                }
-
-                if (!match.cancelVotes) match.cancelVotes = new Set();
-
-                if (match.cancelVotes.has(interaction.user.id) && !isAdmin) {
-                    return interaction.followUp({ content: '⚠️ لقد قمت بالتصويت لإلغاء المباراة بالفعل! في انتظار انضمام بقية اللاعبين للتصويت.', ephemeral: true }).catch(() => {});
-                }
-
-                match.cancelVotes.add(interaction.user.id);
-                saveMatchToDb(match);
-
-                const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
-
-                // إذا اكتمل النصاب المطلوب أو كان المصوت إدارياً
-                if (match.cancelVotes.size >= requiredVotes || isAdmin) {
-                    activeMatches.delete(match.id);
-                    removeMatchFromDb(match.id);
-
-                    const cancelEmbed = new EmbedBuilder()
-                        .setColor('#ed4245')
-                        .setTitle('🛑 تم إلغاء المباراة بالموافقة!')
-                        .setDescription(`تمت الموافقة على إلغاء المباراة رسمياً بناءً على اكتمال تصويت اللاعبين (${match.cancelVotes.size}/${requiredVotes}).\n🔒 سيتم إعادة الجميع إلى غرف الانتظار وحذف الروم خلال 5 ثوانٍ...`)
-                        .setTimestamp();
-
-                    await interaction.editReply({ embeds: [cancelEmbed], components: [] }).catch(async () => {
-                        await interaction.channel.send({ embeds: [cancelEmbed] }).catch(() => {});
-                    });
-
-                    await returnPlayersToWaiting(interaction.guild, match);
-                    await cleanupMatchVoicePermissions(interaction.guild, match);
-
-                    setTimeout(async () => {
-                        try { await interaction.channel.delete(); } catch (e) {}
-                    }, 5000);
-                    return;
-                }
-
-                // تحديث اللوحة بالأصوات الجديدة
-                const payload = buildCancelVotePayload(match, interaction.guild);
-                await interaction.editReply(payload).catch(async () => {
-                    await interaction.message?.edit(payload).catch(() => {});
-                });
-                return;
-            }
-
-            if (customId.startsWith('keep_match_')) {
-                const lockKey = `${interaction.user.id}_${customId}`;
-                if (actionDebounceLocks.has(lockKey)) {
-                    return interaction.reply({ content: '⏳ يرجى الانتظار ثانية...', ephemeral: true }).catch(() => {});
-                }
-                actionDebounceLocks.add(lockKey);
-                setTimeout(() => actionDebounceLocks.delete(lockKey), 3000);
-
-                await interaction.deferUpdate().catch(() => {});
-
-                const match = findMatchFromInteraction(interaction, 'keep_match_');
-                if (!match) {
-                    return interaction.followUp({ content: '❌ هذه المباراة غير نشطة.', ephemeral: true }).catch(() => {});
-                }
-
-                const allPlayers = [...match.team1, ...match.team2];
-                const isParticipant = allPlayers.includes(interaction.user.id);
-                const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
-
-                if (!isParticipant && !isAdmin) {
-                    return interaction.followUp({ content: '❌ فقط المشاركون في المباراة يمكنهم التفاعل مع اللوحة.', ephemeral: true }).catch(() => {});
-                }
-
-                // إذا كان صاحب الطلب أو الإدارة ضغط Keep Match يتم إلغاء التصويت والعودة للماتش
-                if (interaction.user.id === match.cancelInitiatorId || isAdmin) {
-                    match.cancelVotes = new Set();
-                    match.cancelInitiatorId = null;
-                    match.cancelVoteActive = false;
-                    match.cancelMessageId = null;
-                    saveMatchToDb(match);
-
-                    const keepEmbed = new EmbedBuilder()
-                        .setColor('#57f287')
-                        .setTitle('🎮 استمرار المباراة!')
-                        .setDescription(`تم إلغاء طلب إنهاء المباراة بواسطة ${interaction.user}. استمتعوا باللعب!`)
-                        .setTimestamp();
-
-                    return interaction.editReply({ embeds: [keepEmbed], components: [] }).catch(async () => {
-                        await interaction.message?.edit({ embeds: [keepEmbed], components: [] }).catch(() => {});
-                    });
-                }
-
-                const requiredVotes = Math.max(2, Math.ceil(allPlayers.length / 2));
-                return interaction.followUp({ 
-                    content: `✅ صوتك محتسب للاستمرار في اللعب. لن يتم إلغاء المباراة إلا إذا اكتمل تصويت ${requiredVotes} لاعبين على الإلغاء.`, 
-                    ephemeral: true 
-                }).catch(() => {});
-            }
-
         }
 
         if (interaction.isUserSelectMenu() && interaction.customId.startsWith('submit_check_target_')) {
@@ -3805,18 +3852,19 @@ function buildCancelVotePayload(match, guild) {
     const t2Count = (match.team2 || []).filter(uid => match.cancelVotes?.has(uid)).length;
 
     const initiatorId = match.cancelInitiatorId || (match.cancelVotes ? Array.from(match.cancelVotes)[0] : null);
+    const initiatorText = initiatorId ? `<@${initiatorId}>` : 'أحد اللاعبين';
 
     const embed = new EmbedBuilder()
         .setColor('#ed4245')
         .setTitle('⚠️ تصويت إلغاء المباراة | Match Cancel Vote')
         .setDescription(
-            `بدأ اللاعب <@${initiatorId}> طلباً لإلغاء هذه المباراة.\n` +
+            `بدأ اللاعب ${initiatorText} طلباً لإلغاء هذه المباراة.\n` +
             `لإلغاء المباراة، يجب أن يوافق **${requiredVotes}** لاعبين على الأقل بالضغط على زر التصويت أدناه.\n\n` +
             `*يمكن لأعضاء كلا الفريقين الانضمام للتصويت.*`
         )
         .addFields(
             { name: '📊 نسبة الأصوات', value: `**${currentVotes} / ${requiredVotes}** أصوات`, inline: true },
-            { name: '👥 حالة الفريقين', value: `🔴 Team 1: **${t1Count}/${match.team1.length}**\n🟢 Team 2: **${t2Count}/${match.team2.length}**`, inline: true },
+            { name: '👥 حالة الفريقين', value: `🔴 Team 1: **${t1Count}/${match.team1?.length || 0}**\n🟢 Team 2: **${t2Count}/${match.team2?.length || 0}**`, inline: true },
             { name: '🗳️ المصوتون للإلغاء', value: votersList, inline: false }
         )
         .setFooter({ text: 'Apostado Manager • Fair Play System' })
