@@ -326,8 +326,8 @@ function generateSecurityPanelEmbed(guild, settings) {
             `> يمنع نشر روابط الديسكورد، دعوات السيرفرات، وأي روابط خارجية أو ترويج.\n\n` +
             `🖼️ **نظام منع الصور (Anti-Image):** ${antiImageStatus}\n` +
             `> يمنع إرسال الصور والميديا والصور المتحركة لمنع التخريب.\n\n` +
-            `⚡ **نظام منع السبام (Anti-Spam):** ${antiSpamStatus}\n` +
-            `> يمنع تكرار الرسائل السريع والسبام مع كتم مؤقت تلقائي للمخالفين.\n\n` +
+            `⚡ **نظام منع السبام والتباطؤ (Slow Mode 5s):** ${antiSpamStatus}\n` +
+            `> يمنع إرسال الرسائل أسرع من رسالة كل 5 ثوانٍ، مع منع التكرار وكتم تلقائي للمخالفين.\n\n` +
             `📜 **روم سجلات الحماية (Security Logs):** ${logChannelStatus}\n` +
             `━━━━━━━━━━━━━━━━━━━━━━━━━━`
         )
@@ -1461,31 +1461,22 @@ client.on('messageCreate', async message => {
             }
         }
 
-        // 3. أنتي سبام / Anti-Spam (تكرار الرسائل والسرعة المفرطة)
+        // 3. أنتي سبام ووضع التباطؤ / Anti-Spam & Slow Mode (5 Seconds Cooldown)
         if (secSettings.antiSpam) {
             const now = Date.now();
             const spamKey = `${guildId}_${userId}`;
             let userRecord = userSpamTracker.get(spamKey);
             if (!userRecord) {
-                userRecord = { timestamps: [], lastMessage: '', repeatCount: 1, strikes: 0, lastStrike: 0 };
+                userRecord = { lastTimestamp: 0, lastMessage: '', strikes: 0, lastStrike: 0 };
                 userSpamTracker.set(spamKey, userRecord);
             }
 
-            userRecord.timestamps = userRecord.timestamps.filter(t => now - t < 4000);
-            userRecord.timestamps.push(now);
-
+            const timeSinceLastMsg = now - (userRecord.lastTimestamp || 0);
+            const isSlowModeViolation = timeSinceLastMsg < 5000 && userRecord.lastTimestamp > 0;
             const cleanContent = (message.content || '').trim().toLowerCase();
-            if (cleanContent && cleanContent === userRecord.lastMessage) {
-                userRecord.repeatCount += 1;
-            } else {
-                userRecord.lastMessage = cleanContent;
-                userRecord.repeatCount = 1;
-            }
+            const isDuplicate = cleanContent && cleanContent === userRecord.lastMessage && timeSinceLastMsg < 10000;
 
-            const isFastRate = userRecord.timestamps.length >= 5;
-            const isRepeatSpam = userRecord.repeatCount >= 3;
-
-            if (isFastRate || isRepeatSpam) {
+            if (isSlowModeViolation || isDuplicate) {
                 await message.delete().catch(() => {});
 
                 if (now - userRecord.lastStrike > 60000) {
@@ -1496,25 +1487,32 @@ client.on('messageCreate', async message => {
                 userRecord.lastStrike = now;
 
                 if (userRecord.strikes >= 3 && member && member.moderatable) {
-                    await member.timeout(60 * 1000, 'Anti-Spam Auto Timeout').catch(() => {});
+                    await member.timeout(60 * 1000, 'Slow Mode (5s) / Anti-Spam Auto Timeout').catch(() => {});
                     const muteMsg = await message.channel.send({
-                        content: `⛔ تم كتم ${message.author} لمدة دقيقة واحدة تلقائياً بسبب تكرار السبام! 🛡️`
+                        content: `⛔ تم كتم ${message.author} لمدة دقيقة واحدة تلقائياً بسبب تكرار مخالفة التباطؤ (Slow Mode) والسبام! 🛡️`
                     }).catch(() => null);
                     if (muteMsg) setTimeout(() => muteMsg.delete().catch(() => {}), 7000);
 
-                    sendSecurityLog(message.guild, 'كتم عضو بسبب السبام (Anti-Spam Timeout)', `تم كتم العضو تلقائياً لمدة 60 ثانية بعد تكرار السبام.`, '#fee75c', [
+                    sendSecurityLog(message.guild, 'كتم عضو بسبب مخالفة التباطؤ (Slow Mode Timeout)', `تم كتم العضو تلقائياً لمدة 60 ثانية بعد محاولات إرسال رسائل متتالية في أقل من 5 ثوانٍ.`, '#fee75c', [
                         { name: '👤 العضو', value: `${message.author} (\`${message.author.id}\`)`, inline: true },
                         { name: '💬 القناة', value: `${message.channel}`, inline: true },
-                        { name: '⚡ سبب الإجراء', value: isFastRate ? 'سرعة إرسال مفرطة (Fast Messages)' : 'تكرار نفس الرسالة (Duplicate Messages)', inline: false }
+                        { name: '⚡ سبب الإجراء', value: isSlowModeViolation ? 'مخالفة وضع التباطؤ (أقل من 5 ثوانٍ)' : 'تكرار نفس الرسالة', inline: false }
                     ]);
                 } else {
+                    const remainingSec = Math.max(1, Math.ceil((5000 - timeSinceLastMsg) / 1000));
                     const warnMsg = await message.channel.send({
-                        content: `⚡🚫 عذراً ${message.author}، **يرجى التوقف عن السبام وتكرار الرسائل بسرعة!** 🛡️`
+                        content: isDuplicate
+                            ? `⚡🚫 عذراً ${message.author}، **يرجى عدم تكرار نفس الرسالة!** 🛡️`
+                            : `⏳ عذراً ${message.author}، **وضع التباطؤ مفعّل (Slow Mode)!** يرجى الانتظار \`${remainingSec}\` ثانية بين كل رسالة. 🛡️`
                     }).catch(() => null);
-                    if (warnMsg) setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
+                    if (warnMsg) setTimeout(() => warnMsg.delete().catch(() => {}), 4000);
                 }
                 return;
             }
+
+            // تحديث آخر توقيت عند قبول الرسالة
+            userRecord.lastTimestamp = now;
+            userRecord.lastMessage = cleanContent;
         }
     }
 
