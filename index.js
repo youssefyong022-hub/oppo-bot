@@ -215,7 +215,151 @@ db.serialize(() => {
             // تجاهل إن كان موجوداً
         });
     });
+
+    db.run(`CREATE TABLE IF NOT EXISTS server_protection (
+        guildId TEXT PRIMARY KEY,
+        antiLink INTEGER DEFAULT 0,
+        antiImage INTEGER DEFAULT 0,
+        antiSpam INTEGER DEFAULT 0,
+        logChannelId TEXT DEFAULT NULL
+    )`);
 });
+
+// ذاكرة كاش لإعدادات الحماية لتوفير أقصى سرعة استجابة بدون إرهاق قاعدة البيانات
+const protectionCache = new Map();
+const userSpamTracker = new Map();
+
+function getProtectionSettings(guildId) {
+    return new Promise((resolve) => {
+        if (protectionCache.has(guildId)) {
+            return resolve(protectionCache.get(guildId));
+        }
+        db.get(`SELECT * FROM server_protection WHERE guildId = ?`, [guildId], (err, row) => {
+            if (err || !row) {
+                const defaultSettings = {
+                    guildId,
+                    antiLink: 0,
+                    antiImage: 0,
+                    antiSpam: 0,
+                    logChannelId: null
+                };
+                protectionCache.set(guildId, defaultSettings);
+                return resolve(defaultSettings);
+            }
+            const settings = {
+                guildId: row.guildId,
+                antiLink: row.antiLink ? 1 : 0,
+                antiImage: row.antiImage ? 1 : 0,
+                antiSpam: row.antiSpam ? 1 : 0,
+                logChannelId: row.logChannelId || null
+            };
+            protectionCache.set(guildId, settings);
+            resolve(settings);
+        });
+    });
+}
+
+function updateProtectionSetting(guildId, updates) {
+    return new Promise((resolve, reject) => {
+        getProtectionSettings(guildId).then(current => {
+            const updated = { ...current, ...updates };
+            protectionCache.set(guildId, updated);
+            db.run(
+                `INSERT INTO server_protection (guildId, antiLink, antiImage, antiSpam, logChannelId)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(guildId) DO UPDATE SET
+                    antiLink = excluded.antiLink,
+                    antiImage = excluded.antiImage,
+                    antiSpam = excluded.antiSpam,
+                    logChannelId = excluded.logChannelId`,
+                [guildId, updated.antiLink ? 1 : 0, updated.antiImage ? 1 : 0, updated.antiSpam ? 1 : 0, updated.logChannelId || null],
+                (err) => {
+                    if (err) return reject(err);
+                    resolve(updated);
+                }
+            );
+        }).catch(reject);
+    });
+}
+
+async function sendSecurityLog(guild, title, description, color = '#ff3366', fields = []) {
+    try {
+        const settings = await getProtectionSettings(guild.id);
+        if (!settings.logChannelId) return;
+        const channel = await guild.channels.fetch(settings.logChannelId).catch(() => null);
+        if (!channel || !channel.isTextBased()) return;
+
+        const embed = new EmbedBuilder()
+            .setColor(color)
+            .setTitle(`🛡️ سجل الحماية والأمان | ${title}`)
+            .setDescription(description)
+            .setFooter({ text: `${guild.name} • Security System`, iconURL: guild.iconURL() })
+            .setTimestamp();
+
+        if (fields && fields.length > 0) {
+            embed.addFields(fields);
+        }
+
+        await channel.send({ embeds: [embed] }).catch(() => {});
+    } catch (e) {
+        console.error('Error sending security log:', e);
+    }
+}
+
+function generateSecurityPanelEmbed(guild, settings) {
+    const antiLinkStatus = settings.antiLink ? '🟢 **مفعّل (ON)**' : '🔴 **معطّل (OFF)**';
+    const antiImageStatus = settings.antiImage ? '🟢 **مفعّل (ON)**' : '🔴 **معطّل (OFF)**';
+    const antiSpamStatus = settings.antiSpam ? '🟢 **مفعّل (ON)**' : '🔴 **معطّل (OFF)**';
+    const logChannelStatus = settings.logChannelId ? `<#${settings.logChannelId}>` : '`غير محدد (None)`';
+
+    return new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setAuthor({ 
+            name: `${guild.name} • لوحة تحكم حماية السيرفر`, 
+            iconURL: guild.iconURL() || client.user.displayAvatarURL() 
+        })
+        .setThumbnail(guild.iconURL() || client.user.displayAvatarURL())
+        .setDescription(
+            `تحكم بخصائص الأمان والحماية لسيرفرك بسهولة عبر الضغط على الأزرار التفاعلية بالأسفل.\n\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `🔗 **نظام منع الروابط (Anti-Link):** ${antiLinkStatus}\n` +
+            `> يمنع نشر روابط الديسكورد، دعوات السيرفرات، وأي روابط خارجية أو ترويج.\n\n` +
+            `🖼️ **نظام منع الصور (Anti-Image):** ${antiImageStatus}\n` +
+            `> يمنع إرسال الصور والميديا والصور المتحركة لمنع التخريب.\n\n` +
+            `⚡ **نظام منع السبام (Anti-Spam):** ${antiSpamStatus}\n` +
+            `> يمنع تكرار الرسائل السريع والسبام مع كتم مؤقت تلقائي للمخالفين.\n\n` +
+            `📜 **روم سجلات الحماية (Security Logs):** ${logChannelStatus}\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━━━━━`
+        )
+        .setFooter({ text: 'Apostado Security Manager • للإدارة فقط' })
+        .setTimestamp();
+}
+
+function generateSecurityPanelComponents(settings) {
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('sec_toggle_antilink')
+            .setLabel(settings.antiLink ? 'تعطيل أنتي ليان' : 'تفعيل أنتي ليان')
+            .setStyle(settings.antiLink ? ButtonStyle.Danger : ButtonStyle.Success)
+            .setEmoji('🔗'),
+        new ButtonBuilder()
+            .setCustomId('sec_toggle_antiimage')
+            .setLabel(settings.antiImage ? 'تعطيل أنتي صور' : 'تفعيل أنتي صور')
+            .setStyle(settings.antiImage ? ButtonStyle.Danger : ButtonStyle.Success)
+            .setEmoji('🖼️'),
+        new ButtonBuilder()
+            .setCustomId('sec_toggle_antispam')
+            .setLabel(settings.antiSpam ? 'تعطيل أنتي سبام' : 'تفعيل أنتي سبام')
+            .setStyle(settings.antiSpam ? ButtonStyle.Danger : ButtonStyle.Success)
+            .setEmoji('⚡'),
+        new ButtonBuilder()
+            .setCustomId('sec_refresh')
+            .setLabel('تحديث الحالة')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('🔄')
+    );
+    return [row];
+}
 
 // دوال مساعدة لنظام الفحص والتقارير (Player Check & Report Helpers)
 function getCheckStats(guildId) {
@@ -813,6 +957,7 @@ function generateCommandsEmbed(guild) {
             {
                 name: '🛡️ ┃ STAFF & MODERATION',
                 value: 
+                    `\` /security \` or \` !security \` • Server Protection (Anti-Link / Anti-Image / Anti-Spam)\n` +
                     `\` &move <@user/ID> \` • Drag a member into your voice channel\n` +
                     `\` /blacklist add \` or \` !bl \` • Ban player with auto DM alert\n` +
                     `\` /blacklist remove \` or \` !unbl \` • Unban player from matches\n` +
@@ -1193,7 +1338,35 @@ client.once('ready', async () => {
         new SlashCommandBuilder()
             .setName('help')
             .setDescription('عرض دليل الأوامر الرسمي الشامل')
-            .addChannelOption(opt => opt.setName('channel').setDescription('القناة التي ستُرسل فيها البطاقة (اختياري)').setRequired(false))
+            .addChannelOption(opt => opt.setName('channel').setDescription('القناة التي ستُرسل فيها البطاقة (اختياري)').setRequired(false)),
+        new SlashCommandBuilder()
+            .setName('security')
+            .setDescription('🛡️ إدارة وإعدادات حماية السيرفر (أنتي روابط، أنتي صور، أنتي سبام)')
+            .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+            .addSubcommand(sub =>
+                sub.setName('panel')
+                    .setDescription('عرض لوحة تحكم الحماية التفاعلية بالأزرار')
+            )
+            .addSubcommand(sub =>
+                sub.setName('antilink')
+                    .setDescription('تفعيل أو تعطيل نظام منع الروابط والترويج')
+                    .addBooleanOption(opt => opt.setName('enable').setDescription('تفعيل (True) أو تعطيل (False)').setRequired(true))
+            )
+            .addSubcommand(sub =>
+                sub.setName('antiimage')
+                    .setDescription('تفعيل أو تعطيل نظام منع الصور والوسائط')
+                    .addBooleanOption(opt => opt.setName('enable').setDescription('تفعيل (True) أو تعطيل (False)').setRequired(true))
+            )
+            .addSubcommand(sub =>
+                sub.setName('antispam')
+                    .setDescription('تفعيل أو تعطيل نظام منع السبام وتكرار الرسائل')
+                    .addBooleanOption(opt => opt.setName('enable').setDescription('تفعيل (True) أو تعطيل (False)').setRequired(true))
+            )
+            .addSubcommand(sub =>
+                sub.setName('logchannel')
+                    .setDescription('تعيين روم سجلات وإشعارات الحماية والأمان')
+                    .addChannelOption(opt => opt.setName('channel').setDescription('القناة المراد إرسال السجلات إليها').setRequired(true))
+            )
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -1213,6 +1386,137 @@ client.on('messageCreate', async message => {
 
     const userId = message.author.id;
     const guildId = message.guild.id;
+
+    // التحقق من صلاحيات العضو للاستثناء (Staff / Admin Bypass)
+    let member = message.member;
+    if (!member && message.guild) {
+        member = await message.guild.members.fetch(userId).catch(() => null);
+    }
+
+    const isStaff = member && (
+        member.permissions.has(PermissionFlagsBits.Administrator) ||
+        member.permissions.has(PermissionFlagsBits.ManageGuild) ||
+        member.roles.cache.some(r => {
+            const n = r.name.toLowerCase();
+            return n.includes('owner') || n.includes('admin') || n.includes('staff') || n.includes('mod');
+        })
+    );
+
+    // --- فلاتر حماية السيرفر (Server Protection Filters) ---
+    if (!isStaff) {
+        const secSettings = await getProtectionSettings(guildId);
+
+        // 1. أنتي ليان / Anti-Link (منع نشر الروابط والدعوات والترويج)
+        if (secSettings.antiLink) {
+            const rawContent = message.content || '';
+            const hasInvite = /(https?:\/\/)?(www\.)?(discord\.(gg|io|me|li)|discordapp\.com\/invite|discord\.com\/invite)\/[a-zA-Z0-9_-]+/i.test(rawContent);
+            const hasUrl = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|([a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.(com|net|org|io|gg|me|tv|xyz|app|dev|top|site|online|live|store|link|info|ru|co|uk)[^\s]*)/i.test(rawContent);
+
+            if (hasInvite || hasUrl) {
+                await message.delete().catch(() => {});
+                const warnMsg = await message.channel.send({
+                    content: `⚠️ عذراً ${message.author}، **يُمنع منعاً باتاً إرسال الروابط أو الترويج** في هذا السيرفر! 🛡️`
+                }).catch(() => null);
+                if (warnMsg) {
+                    setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
+                }
+                sendSecurityLog(message.guild, 'منع إرسال رابط (Anti-Link)', `قام العضو بمحاولة إرسال رابط في الشات وتم حذف رسالته تلقائياً.`, '#ed4245', [
+                    { name: '👤 العضو', value: `${message.author} (\`${message.author.id}\`)`, inline: true },
+                    { name: '💬 القناة', value: `${message.channel}`, inline: true },
+                    { name: '🔗 المحتوى المخالف', value: `\`\`\`${rawContent.slice(0, 500)}\`\`\``, inline: false }
+                ]);
+                return;
+            }
+        }
+
+        // 2. أنتي صور / Anti-Image (منع الصور والميديا والصور المتحركة)
+        if (secSettings.antiImage) {
+            let hasImage = false;
+            if (message.attachments.size > 0) {
+                hasImage = message.attachments.some(att => {
+                    const ct = (att.contentType || '').toLowerCase();
+                    const name = (att.name || '').toLowerCase();
+                    return ct.startsWith('image/') || ct.startsWith('video/') || /\.(png|jpe?g|gif|webp|bmp|svg|mp4|mov|webm)$/i.test(name);
+                });
+            }
+
+            if (!hasImage && message.content) {
+                hasImage = /https?:\/\/(tenor\.com|giphy\.com|media\.giphy\.com|cdn\.discordapp\.com\/attachments|images-ext-\d+\.discordapp\.net|imgur\.com)\/[^\s]+/i.test(message.content) ||
+                           /https?:\/\/[^\s]+\.(png|jpe?g|gif|webp|bmp)($|\?)/i.test(message.content);
+            }
+
+            if (hasImage) {
+                await message.delete().catch(() => {});
+                const warnMsg = await message.channel.send({
+                    content: `🖼️🚫 عذراً ${message.author}، **يُمنع إرسال الصور والوسائط** في هذا الشات! 🛡️`
+                }).catch(() => null);
+                if (warnMsg) {
+                    setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
+                }
+                sendSecurityLog(message.guild, 'منع إرسال صورة/ميديا (Anti-Image)', `قام العضو بإرسال صورة أو وسائط وتم حذف رسالته فوراً.`, '#ed4245', [
+                    { name: '👤 العضو', value: `${message.author} (\`${message.author.id}\`)`, inline: true },
+                    { name: '💬 القناة', value: `${message.channel}`, inline: true }
+                ]);
+                return;
+            }
+        }
+
+        // 3. أنتي سبام / Anti-Spam (تكرار الرسائل والسرعة المفرطة)
+        if (secSettings.antiSpam) {
+            const now = Date.now();
+            const spamKey = `${guildId}_${userId}`;
+            let userRecord = userSpamTracker.get(spamKey);
+            if (!userRecord) {
+                userRecord = { timestamps: [], lastMessage: '', repeatCount: 1, strikes: 0, lastStrike: 0 };
+                userSpamTracker.set(spamKey, userRecord);
+            }
+
+            userRecord.timestamps = userRecord.timestamps.filter(t => now - t < 4000);
+            userRecord.timestamps.push(now);
+
+            const cleanContent = (message.content || '').trim().toLowerCase();
+            if (cleanContent && cleanContent === userRecord.lastMessage) {
+                userRecord.repeatCount += 1;
+            } else {
+                userRecord.lastMessage = cleanContent;
+                userRecord.repeatCount = 1;
+            }
+
+            const isFastRate = userRecord.timestamps.length >= 5;
+            const isRepeatSpam = userRecord.repeatCount >= 3;
+
+            if (isFastRate || isRepeatSpam) {
+                await message.delete().catch(() => {});
+
+                if (now - userRecord.lastStrike > 60000) {
+                    userRecord.strikes = 1;
+                } else {
+                    userRecord.strikes += 1;
+                }
+                userRecord.lastStrike = now;
+
+                if (userRecord.strikes >= 3 && member && member.moderatable) {
+                    await member.timeout(60 * 1000, 'Anti-Spam Auto Timeout').catch(() => {});
+                    const muteMsg = await message.channel.send({
+                        content: `⛔ تم كتم ${message.author} لمدة دقيقة واحدة تلقائياً بسبب تكرار السبام! 🛡️`
+                    }).catch(() => null);
+                    if (muteMsg) setTimeout(() => muteMsg.delete().catch(() => {}), 7000);
+
+                    sendSecurityLog(message.guild, 'كتم عضو بسبب السبام (Anti-Spam Timeout)', `تم كتم العضو تلقائياً لمدة 60 ثانية بعد تكرار السبام.`, '#fee75c', [
+                        { name: '👤 العضو', value: `${message.author} (\`${message.author.id}\`)`, inline: true },
+                        { name: '💬 القناة', value: `${message.channel}`, inline: true },
+                        { name: '⚡ سبب الإجراء', value: isFastRate ? 'سرعة إرسال مفرطة (Fast Messages)' : 'تكرار نفس الرسالة (Duplicate Messages)', inline: false }
+                    ]);
+                } else {
+                    const warnMsg = await message.channel.send({
+                        content: `⚡🚫 عذراً ${message.author}، **يرجى التوقف عن السبام وتكرار الرسائل بسرعة!** 🛡️`
+                    }).catch(() => null);
+                    if (warnMsg) setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
+                }
+                return;
+            }
+        }
+    }
 
     // تتبع الـ XP
     db.get(`SELECT * FROM users WHERE userId = ? AND guildId = ?`, [userId, guildId], (err, row) => {
@@ -1288,6 +1592,53 @@ client.on('messageCreate', async message => {
     if (helpTriggers.includes(content.toLowerCase())) {
         const embed = generateCommandsEmbed(message.guild);
         return message.reply({ embeds: [embed] });
+    }
+
+    // أمر إدارة حماية السيرفر النصي !security أو !protect
+    if (content.toLowerCase().startsWith('!security') || content.toLowerCase().startsWith('!protect')) {
+        const hasAdminPerm = message.member.permissions.has(PermissionFlagsBits.ManageGuild) || 
+                             message.member.permissions.has(PermissionFlagsBits.Administrator);
+        if (!hasAdminPerm) {
+            return message.reply('❌ هذا الأمر مخصص لطاقم إدارة السيرفر فقط!');
+        }
+
+        const parts = content.trim().split(/\s+/);
+        const sub = parts[1]?.toLowerCase();
+        const curSettings = await getProtectionSettings(guildId);
+
+        if (sub === 'antilink') {
+            const val = parts[2]?.toLowerCase();
+            const enable = ['on', '1', 'enable', 'true'].includes(val) ? 1 : (['off', '0', 'disable', 'false'].includes(val) ? 0 : (curSettings.antiLink ? 0 : 1));
+            const updated = await updateProtectionSetting(guildId, { antiLink: enable });
+            return message.reply(`✅ **تم ${updated.antiLink ? 'تفعيل 🟢' : 'تعطيل 🔴'} نظام منع الروابط والترويج (Anti-Link)!**`);
+        }
+
+        if (sub === 'antiimage' || sub === 'images' || sub === 'photo' || sub === 'photos') {
+            const val = parts[2]?.toLowerCase();
+            const enable = ['on', '1', 'enable', 'true'].includes(val) ? 1 : (['off', '0', 'disable', 'false'].includes(val) ? 0 : (curSettings.antiImage ? 0 : 1));
+            const updated = await updateProtectionSetting(guildId, { antiImage: enable });
+            return message.reply(`✅ **تم ${updated.antiImage ? 'تفعيل 🟢' : 'تعطيل 🔴'} نظام منع الصور والوسائط (Anti-Image)!**`);
+        }
+
+        if (sub === 'antispam' || sub === 'spam') {
+            const val = parts[2]?.toLowerCase();
+            const enable = ['on', '1', 'enable', 'true'].includes(val) ? 1 : (['off', '0', 'disable', 'false'].includes(val) ? 0 : (curSettings.antiSpam ? 0 : 1));
+            const updated = await updateProtectionSetting(guildId, { antiSpam: enable });
+            return message.reply(`✅ **تم ${updated.antiSpam ? 'تفعيل 🟢' : 'تعطيل 🔴'} نظام منع السبام وتكرار الرسائل (Anti-Spam)!**`);
+        }
+
+        if (sub === 'logchannel' || sub === 'log' || sub === 'logs') {
+            const targetChannel = message.mentions.channels.first() || (parts[2] ? message.guild.channels.cache.get(parts[2]) : null);
+            if (!targetChannel) {
+                return message.reply('ℹ️ **الاستخدام:** `!security logchannel #channel` لتحديد روم سجلات الحماية.');
+            }
+            await updateProtectionSetting(guildId, { logChannelId: targetChannel.id });
+            return message.reply(`✅ **تم تعيين روم سجلات الحماية بنجاح إلى:** ${targetChannel}`);
+        }
+
+        const embed = generateSecurityPanelEmbed(message.guild, curSettings);
+        const components = generateSecurityPanelComponents(curSettings);
+        return message.reply({ embeds: [embed], components });
     }
 
     // أمر النقل الصوتي &move أو !move
@@ -2169,11 +2520,90 @@ client.on('interactionCreate', async interaction => {
 
                 return interaction.reply({ embeds: [embed] });
             }
+
+            if (commandName === 'security') {
+                if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+                    return interaction.reply({ content: '❌ هذا الأمر مخصص لطاقم إدارة السيرفر فقط!', ephemeral: true });
+                }
+
+                const subCmd = interaction.options.getSubcommand();
+                const currentSettings = await getProtectionSettings(interaction.guild.id);
+
+                if (subCmd === 'panel') {
+                    const embed = generateSecurityPanelEmbed(interaction.guild, currentSettings);
+                    const components = generateSecurityPanelComponents(currentSettings);
+                    return interaction.reply({ embeds: [embed], components });
+                }
+
+                if (subCmd === 'antilink') {
+                    const enable = interaction.options.getBoolean('enable');
+                    const updated = await updateProtectionSetting(interaction.guild.id, { antiLink: enable ? 1 : 0 });
+                    return interaction.reply({
+                        content: `✅ **تم ${updated.antiLink ? 'تفعيل 🟢' : 'تعطيل 🔴'} نظام منع الروابط (Anti-Link) بنجاح!**`,
+                        ephemeral: true
+                    });
+                }
+
+                if (subCmd === 'antiimage') {
+                    const enable = interaction.options.getBoolean('enable');
+                    const updated = await updateProtectionSetting(interaction.guild.id, { antiImage: enable ? 1 : 0 });
+                    return interaction.reply({
+                        content: `✅ **تم ${updated.antiImage ? 'تفعيل 🟢' : 'تعطيل 🔴'} نظام منع الصور (Anti-Image) بنجاح!**`,
+                        ephemeral: true
+                    });
+                }
+
+                if (subCmd === 'antispam') {
+                    const enable = interaction.options.getBoolean('enable');
+                    const updated = await updateProtectionSetting(interaction.guild.id, { antiSpam: enable ? 1 : 0 });
+                    return interaction.reply({
+                        content: `✅ **تم ${updated.antiSpam ? 'تفعيل 🟢' : 'تعطيل 🔴'} نظام منع السبام (Anti-Spam) بنجاح!**`,
+                        ephemeral: true
+                    });
+                }
+
+                if (subCmd === 'logchannel') {
+                    const channel = interaction.options.getChannel('channel');
+                    if (!channel.isTextBased()) {
+                        return interaction.reply({ content: '❌ يرجى اختيار قناة كتابية صالحة (Text Channel).', ephemeral: true });
+                    }
+                    await updateProtectionSetting(interaction.guild.id, { logChannelId: channel.id });
+                    return interaction.reply({
+                        content: `✅ **تم تعيين روم سجلات الحماية بنجاح إلى:** ${channel}`,
+                        ephemeral: true
+                    });
+                }
+            }
         }
 
-        // --- 2. أزرار الماتش والمودال ---
+        // --- 2. أزرار الماتش والمودال ولوحة الحماية ---
         if (interaction.isButton()) {
             const { customId } = interaction;
+
+            // التعامل مع أزرار لوحة حماية السيرفر التفاعلية (Security Dashboard Buttons)
+            if (customId.startsWith('sec_')) {
+                if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+                    return interaction.reply({ content: '❌ فقط طاقم الإدارة يمكنهم تغيير إعدادات الحماية!', ephemeral: true });
+                }
+
+                const currentSettings = await getProtectionSettings(interaction.guild.id);
+                let updated = currentSettings;
+
+                if (customId === 'sec_toggle_antilink') {
+                    updated = await updateProtectionSetting(interaction.guild.id, { antiLink: currentSettings.antiLink ? 0 : 1 });
+                } else if (customId === 'sec_toggle_antiimage') {
+                    updated = await updateProtectionSetting(interaction.guild.id, { antiImage: currentSettings.antiImage ? 0 : 1 });
+                } else if (customId === 'sec_toggle_antispam') {
+                    updated = await updateProtectionSetting(interaction.guild.id, { antiSpam: currentSettings.antiSpam ? 0 : 1 });
+                } else if (customId === 'sec_refresh') {
+                    updated = await getProtectionSettings(interaction.guild.id);
+                }
+
+                const newEmbed = generateSecurityPanelEmbed(interaction.guild, updated);
+                const newComponents = generateSecurityPanelComponents(updated);
+
+                return interaction.update({ embeds: [newEmbed], components: newComponents });
+            }
 
             // فتح نموذج إدخال معلومات الروم
             if (customId.startsWith('enter_room_info_')) {
